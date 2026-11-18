@@ -17,6 +17,7 @@
 - 模具保养停机：计划→主管批准→保养完检；批准窗口同模具不得重叠。新开工核对停机时间、同模已有running实绩，批准停机也检查未完工试模，避免冲突。已完检保留停机历史，过去已签结数据不改。
 - 试模材料领耗：主管树脂批次入库，树脂状态available/quarantine；运行实绩按批次一次领料，锁库存，冻结单价；完工且未建结算可一次退余料，最多退领量。净耗成本=Σ((领kg−退kg)×单价快照)。所有新结算按台账取成本，拒绝任意覆盖；结算建立后领退料冻结。已signed历史数值保持，不补写旧凭据。
 - 客户交付验收：只从signed结算交样，样件数≤实绩good_shots；发样→客户签收→接受或整改→主管关闭。整改必须绑定原完工之后新一次同模具signed实绩，旧实绩或其他模具不能替代；重复签收/关闭拒绝。这里只留本地交接和客户意见，不发送外部消息。
+- 验收风险复核（V4）：同模反复整改不得再直接发样。用**已签收且主管关闭的首次客户意见**（接受/整改）训练独立的逻辑回归分类器，按模具 LeaveOneGroupOut 分组验证，给出再次发样的不接受概率；主管设定全局拦截阈值，全局已关闭意见<20 或同模具<6 条即样本不足拦截、不出概率。复核在发起当时固化实绩特征与训练集指纹（basis 快照），后补意见不混入既有复核；估价工时 Ridge 回归与本分类器数据源/模型完全独立、互不影响。高风险（概率≥阈值）拦截后须主管填说明放行；复核中断可重试且复用同一条记录、不新增复核。同模具登记新整改关闭时，该模具仍处于「已放行未发样」的许可一律作废，须重新复核；发样与整改登记在同一加锁体系内互斥，并发请求一并拦住；已发样（已交付）历史不回写。页面可发起复核、主管放行与发样，分「待复核/风险拦截/已放行/已发样」四栏并可查概率、分组指标与特征系数依据。
 
 ## 快速启动
 
@@ -31,8 +32,8 @@ docker compose exec -T backend python -m scripts.seed_demo
 
 |账号|口令|角色|任务与权限|
 |---|---|---|---|
-|admin@ruimo.demo|Mould2026!|admin|全部读写、开放机时、最终承诺、超时完工与结算签结、保养批准、树脂入库/隔离、客户交付关闭|
-|estimator@ruimo.demo|Mould2026!|estimator|录入模具、建立修订估价、估算、申请机时；常规开工完工、保养计划/完检、领退料、客户签收/验收记录、结算草稿；不能承诺或签结|
+|admin@ruimo.demo|Mould2026!|admin|全部读写、开放机时、最终承诺、超时完工与结算签结、保养批准、树脂入库/隔离、客户交付关闭、风险阈值设定与高风险放行|
+|estimator@ruimo.demo|Mould2026!|estimator|录入模具、建立修订估价、估算、申请机时；常规开工完工、保养计划/完检、领退料、客户签收/验收记录、结算草稿、发起/重试验收风险复核；不能承诺、签结或放行高风险|
 |viewer@ruimo.demo|Mould2026!|viewer|只读九业务页面与审计|
 
 JWT 8 小时过期，密码 PBKDF2-SHA256 盐化存储。演示账号只用于本地，部署前修改 JWT_SECRET 和数据库演示口令。
@@ -61,6 +62,8 @@ Redis worker结果持久化 Estimate.model_result，同时写 backend/worker 共
 
 V3范围：保养时间和客户签收可按演示日期录入，无设备时钟联锁；同模具仅允许一份running实绩。每次试模对同树脂批次只领一次，不提供追加领料或多次退料；批次隔离后的退回库存仍保持隔离。客户样件数按good_shots上界，不另展开一射多腔件数。没有仓库外接、实际物流发送、客户门户或电子签章。
 
+V4范围与口径：验收风险分类器只学已签收且主管关闭的首次客户意见，未关闭/在途交付不进训练集；标签在登记意见与关闭时两次固化进交付快照，后补意见不改写既有复核的 basis。特征为模腔、滑块、钢材、重量、良品数、总射次、良率、实际工时、工时偏差%、毛利共 10 项，标准化后用 balanced 类权重逻辑回归，阈值由主管维护（默认0.5，开区间0–1）。样本门限固定为全局≥20 且同模具≥6 且两类标签齐全，任一不足即 `insufficient` 拦截、不返回概率。分组验证为按模具 LeaveOneGroupOut，训练折单类时跳过该折。复核状态机 `pending→insufficient/blocked/released→dispatched`，作废 `voided` 为终态但允许对同结算重新发起一条新复核（旧作废记录保留）；中断保持 pending、重试复用同记录累加 attempts。同模新整改只作废「已放行未发样」许可，已发样属已交付历史不回写；分类器与估价回归互不调用、互不改动。
+
 ## 本地开发与结构
 
 |层|实现|
@@ -74,13 +77,15 @@ V3范围：保养时间和客户签收可按演示日期录入，无设备时钟
 
 V3 `backend/src/workshop_models.py`定义MaintenanceWindow、ResinLot、TrialMaterial、ReviewMaterialLedger、TrialDelivery；`workshop_schemas.py`校验时间、kg、客户记录，`workshop_service.py`负责停机/领耗/交付规则，`workshop_routes.py`提供`/maintenance-windows`、`/resin-lots`、`/trial-materials`、`/trial-deliveries`。原表列无新增，create_all非破坏性增加5张表；新结算另存材料快照凭据，不改旧signed记录。
 
+V4 `backend/src/risk_models.py` 新增 AcceptanceRiskReview、RiskThresholdSetting 两张表（create_all 非破坏性建表，原表无改动）；表上用部分唯一索引 `ux_risk_review_active` 保证每个结算至多一条「未作废」复核，作废记录保留可追溯并允许重新发起新建；`risk_ml.py` 是独立于 `ml.py` 的验收风险分类器（标准化 + balanced 逻辑回归，按模具 LeaveOneGroupOut 分组验证）；`risk_service.py` 管复核状态机、阈值、主管放行、旧许可作废与发样门；`risk_routes.py` 暴露 `/acceptance-risk-reviews`、`/risk-threshold`。发样 `POST /trial-deliveries` 现在先过风险门，整改关闭联动作废同模未发样许可。`scripts/seed_demo.py` 按自然键补 27 条已关闭历史交付（每模具 9 条、含接受与整改首次意见）作为固定训练样本。`frontend/src/pages/risk.js` 是第 10 页。已交付历史不回写：上线前的旧交付不强制补复核。
+
 `backend/src/execution_models.py` 定义实绩/结算外键与唯一约束，`execution_schemas.py` 校验输入，`execution_service.py` 管理快照、工时与成本事务，`execution_routes.py` 暴露 `/executions`、`/cost-reviews` 及 finish/sign 操作。
 
-`frontend/src/pages/` 的 moulds/estimates/evidence/schedule/executions/reviews 及 maintenance/materials/deliveries 是九页；`api.js` HTTP；`store.js` 业务状态；`components/common.js` 状态标签/证据条/选择器跨页复用；`utils/format.js` 转义、金额/数字和表单工具。
+`frontend/src/pages/` 的 moulds/estimates/evidence/schedule/executions/reviews 及 maintenance/materials/deliveries/risk 是十页；`api.js` HTTP；`store.js` 业务状态；`components/common.js` 状态标签/证据条/选择器跨页复用；`utils/format.js` 转义、金额/数字和表单工具。
 
 本地 `pip install -r backend/requirements.txt`，设置 DATABASE_URL/REDIS_URL，在backend目录 `uvicorn src.main:app --reload`，另一终端 `python -m src.worker`。前端建议使用Compose Nginx代理。
 
-枚举位置：角色、估价状态、实绩状态、结算、保养、树脂、领料、交付状态与钢材定义在 `backend/src/constants.py` 和 `frontend/src/constants.js`；`GET /enums` 返回上述九组。钢材输入Literal在schemas.py、模型编码在ml.py。后端权限为真实约束，前端禁用按钮作提示。IntegrityError转成可恢复409。
+枚举位置：角色、估价状态、实绩状态、结算、保养、树脂、领料、交付、验收风险复核状态与钢材定义在 `backend/src/constants.py` 和 `frontend/src/constants.js`；`GET /enums` 返回上述十组。钢材输入Literal在schemas.py、模型编码在ml.py。后端权限为真实约束，前端禁用按钮作提示。IntegrityError转成可恢复409。
 
 环境变量见 `.env.example`：COMPOSE_PROJECT_NAME、FRONTEND_PORT、BACKEND_PORT、DB_PORT、JWT_SECRET、SEED_DEMO。`COMPOSE_SUBNET=10.221.23.0/24` 是本机默认地址池已满后的专用网段；冲突时改空闲网段。数据库、Redis、计算产物为命名卷。
 

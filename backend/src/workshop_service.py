@@ -6,6 +6,7 @@ from .models import Mould,Estimate
 from .execution_models import TrialExecution,CostReview
 from .workshop_models import MaintenanceWindow,ResinLot,TrialMaterial,ReviewMaterialLedger,TrialDelivery
 from .services import item,serialize,record
+from . import risk_service as risk_svc
 
 def stamp(value):
     from .execution_service import stamp as convert
@@ -70,11 +71,16 @@ def freeze_material_cost(s,review):
 def deliver(s,p,u):
     r=locked(s,CostReview,p.review_id)
     if r.status!='signed':raise HTTPException(409,'只有已签结算可交付试模样件')
-    x=item(s,TrialExecution,r.execution_id);e=item(s,Estimate,x.estimate_id)
+    x=item(s,TrialExecution,r.execution_id);e=item(s,Estimate,x.estimate_id);m=item(s,Mould,e.mould_id)
     if p.good_samples>x.good_shots:raise HTTPException(409,'交付样件不得超过实绩良品射次数')
     if s.scalar(select(TrialDelivery.id).where(TrialDelivery.review_id==r.id)):raise HTTPException(409,'该签结算已有交付，不可重复发样')
-    snap={'review_id':r.id,'execution_id':x.id,'estimate_code':e.code,'mould_id':e.mould_id,'mould_code':x.snapshot['mould_code'],'good_shots':x.good_shots,'actual_hours':x.actual_hours,'material_cost':r.material_cost,'signed_by':r.signed_by,'ended_at':x.ended_at,'dispatched_at':datetime.now(timezone.utc).isoformat()}
-    d=TrialDelivery(**p.model_dump(),snapshot=snap,state='dispatched');s.add(d);s.flush();record(s,u,'样件交付 '+e.code);return view(s,d)
+    # 发样门：必须持有针对本结算的有效风险放行许可；与整改登记在同一加锁体系内互斥
+    risk_svc.ensure_dispatch_permit(s,r.id)
+    snap={'review_id':r.id,'execution_id':x.id,'estimate_code':e.code,'mould_id':e.mould_id,'mould_code':x.snapshot['mould_code'],'cavities':m.cavities,'slides':m.slides,'steel':m.steel,'weight_kg':m.weight_kg,'good_shots':x.good_shots,'total_shots':x.total_shots,'actual_hours':x.actual_hours,'material_cost':r.material_cost,'variance_pct':r.variance_pct,'margin':r.margin,'signed_by':r.signed_by,'ended_at':x.ended_at,'dispatched_at':datetime.now(timezone.utc).isoformat(),'review':{'variance_pct':r.variance_pct,'margin':r.margin}}
+    d=TrialDelivery(**p.model_dump(),snapshot=snap,state='dispatched');s.add(d);s.flush()
+    # 发样成功才把对应风险复核置为已发样；已交付历史不回写
+    risk_svc.mark_dispatched(s,r.id)
+    record(s,u,'样件交付 '+e.code);return view(s,d)
 def receive_delivery(s,id,p,u):
     d=locked(s,TrialDelivery,id)
     if d.state!='dispatched':raise HTTPException(409,'仅已发样可登记签收，不能重复签收')
@@ -82,7 +88,10 @@ def receive_delivery(s,id,p,u):
 def decide_delivery(s,id,p,u):
     d=locked(s,TrialDelivery,id)
     if d.state!='received':raise HTTPException(409,'客户签收后才能登记接受或整改意见')
-    d.state=p.decision;d.customer_note=p.customer_note;record(s,u,'登记客户验收 '+d.tracking);return view(s,d)
+    d.state=p.decision;d.customer_note=p.customer_note
+    # 固化首次客户意见：关闭后即成为风险分类器的固定训练标签，后续不改写
+    d.snapshot={**d.snapshot,'first_decision':p.decision,'first_note':p.customer_note}
+    record(s,u,'登记客户验收 '+d.tracking);return view(s,d)
 def close_delivery(s,id,p,u):
     d=locked(s,TrialDelivery,id)
     if d.state not in ('accepted','rectification'):raise HTTPException(409,'仅接受或待整改交付可由主管关闭，不能重复')
@@ -91,5 +100,11 @@ def close_delivery(s,id,p,u):
         r=item(s,CostReview,p.correction_review_id);x=item(s,TrialExecution,r.execution_id);e=item(s,Estimate,x.estimate_id)
         if r.status!='signed' or x.id<=d.snapshot['execution_id'] or e.mould_id!=d.snapshot['mould_id'] or datetime.fromisoformat(x.started_at)<=datetime.fromisoformat(d.snapshot['ended_at']):raise HTTPException(409,'整改必须为原完工之后新执行、同模具且已签结的实绩')
         d.correction_review_id=r.id
+        # 同模具出现新整改：先锁模具再作废该模具仍有效的放行许可，与发样互斥
+        locked(s,Mould,e.mould_id)
+        risk_svc.invalidate_for_rectification(s,e.mould_id,u)
     elif p.correction_review_id:raise HTTPException(409,'客户已接受，无须替换整改实绩')
-    d.state='closed';d.closed_by=u.email;record(s,u,'主管关闭交付 '+d.tracking);return view(s,d)
+    d.state='closed';d.closed_by=u.email
+    # 关闭时再次冻结首次意见与标签，保证训练集只含已签收且已关闭的确定意见
+    d.snapshot={**d.snapshot,'closed_decision':d.snapshot.get('first_decision'),'closed_at':datetime.now(timezone.utc).isoformat()}
+    record(s,u,'主管关闭交付 '+d.tracking);return view(s,d)

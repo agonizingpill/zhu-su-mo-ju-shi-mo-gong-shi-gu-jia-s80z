@@ -9,3 +9,6 @@ export const MAINTENANCE_STATES={planned:'待批准保养',approved:'停机已�
 export const RESIN_STATES={available:'批次可用',quarantine:'批次隔离'};
 export const MATERIAL_STATES={issued:'已领料',returned:'已登记退料'};
 export const DELIVERY_STATES={dispatched:'已发样待签收',received:'客户已签收',accepted:'客户接受',rectification:'需整改重试',closed:'主管已关闭'};
+
+export const RISK_REVIEW_STATES={pending:'待复核',insufficient:'样本不足拦截',blocked:'风险拦截',released:'已放行',dispatched:'已发样',voided:'旧许可作废'};
+export const RISK_TABS=[['pending','待复核'],['blocked','风险拦截'],['released','已放行'],['dispatched','已发样']];
